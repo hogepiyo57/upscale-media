@@ -78,13 +78,25 @@
     background: repeating-conic-gradient(#8883 0 25%, transparent 0 50%) 0 0/16px 16px;
     user-select: none; touch-action: none;
   }
+  .cmp { margin: 0 auto; cursor: grab; }
+  .stage { position: relative; transform-origin: 0 0; will-change: transform; }
   .cmp canvas { display: block; width: 100%; height: auto; }
   .cmp .before { position: absolute; inset: 0; clip-path: inset(0 50% 0 0); }
   .cmp .before canvas { width: 100%; height: 100%; }
   .bar {
-    position: absolute; top: 0; bottom: 0; left: 50%; width: 2px; background: #fff;
+    position: absolute; top: 0; bottom: 0; left: 50%; width: 2px; margin-left: -1px; background: #fff;
     box-shadow: 0 0 6px #0008; pointer-events: none;
   }
+  .knob {
+    position: absolute; top: 50%; left: 50%; width: 44px; height: 44px; margin: -22px 0 0 -22px;
+    border-radius: 50%; background: #fff; color: #333; display: grid; place-items: center;
+    font-size: 16px; box-shadow: 0 2px 10px #0009; cursor: ew-resize; touch-action: none;
+  }
+  .zoom { position: absolute; right: 10px; bottom: 10px; display: flex; gap: 6px; }
+  .zoom button { width: 40px; height: 40px; padding: 0; border-radius: 50%; background: #000b; color: #fff; border: 0; font-size: 18px; }
+  .btns { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; }
+  .hint2 { color: var(--muted); font-size: 13px; margin: 8px 0 0; }
+  @media (max-width: 640px) { .btns button { flex: 1 1 100%; } }
   .tag {
     position: absolute; top: 10px; padding: 2px 10px; border-radius: 99px; font-size: 12px;
     background: #000a; color: #fff;
@@ -96,7 +108,7 @@
 </head>
 <body>
 <div class="wrap">
-  <h1>Upscale Media <span class="ver">v2</span></h1>
+  <h1>Upscale Media <span class="ver">v3</span></h1>
   <p class="sub">画像をドロップするだけで、解像度を上げてきれいに。処理はすべてあなたのブラウザ内で行われ、画像は外部に送信されません。</p>
 
   <label id="drop" for="file">
@@ -139,12 +151,20 @@
   <div class="result" id="result">
     <div class="meta" id="meta"></div>
     <div class="cmp" id="cmp">
-      <canvas id="after"></canvas>
-      <div class="before"><canvas id="before"></canvas></div>
-      <div class="bar" id="bar"></div>
+      <div class="stage" id="stage">
+        <canvas id="after"></canvas>
+        <div class="before"><canvas id="before"></canvas></div>
+      </div>
+      <div class="bar" id="bar"><div class="knob" id="knob">↔</div></div>
       <span class="tag l">Before</span><span class="tag r">After</span>
+      <div class="zoom"><button id="zin" aria-label="拡大">＋</button><button id="zout" aria-label="縮小">－</button><button id="zreset" aria-label="全体表示">⤢</button></div>
     </div>
-    <p style="margin-top:14px"><button id="dl" class="primary">PNGで保存</button></p>
+    <p class="hint2">2本指でピンチ（拡大・縮小）、1本指でドラッグして移動。丸いつまみを動かすと Before / After を比べられます。</p>
+    <div class="btns">
+      <button id="save" class="primary" disabled>写真に保存</button>
+      <button id="dl">ファイルとして保存（ダウンロード）</button>
+    </div>
+    <p class="hint2">iPhone / iPad は「写真に保存」→ 共有メニューの「画像を保存」で写真アプリに入ります。</p>
   </div>
 
   <p class="note">AI方式は初回のみモデル（数MB）をダウンロードします。大きな画像は自動的に分割して処理します。AIが使えない環境では高速方式に自動で切り替わります。</p>
@@ -280,27 +300,102 @@
     const g = b.getContext('2d'); g.imageSmoothingEnabled = false;
     g.drawImage(srcImg, 0, 0, outCanvas.width, outCanvas.height);
     $('result').style.display = 'block';
-    $('meta').textContent = `${w0}×${h0} → ${outCanvas.width}×${outCanvas.height}px（${used === 'ai' ? 'AI' : '高速'}方式・${sec}秒）。バーをドラッグで比較できます。`;
+    $('meta').textContent = `${w0}×${h0} → ${outCanvas.width}×${outCanvas.height}px（${used === 'ai' ? 'AI' : '高速'}方式・${sec}秒）。`;
     setStatus('完了しました。');
-    setSlider(0.5);
+    resetView(); makeBlob();
     $('result').scrollIntoView({ behavior: 'smooth', block: 'start' });
   }
 
-  function setSlider(r) {
-    r = Math.max(0, Math.min(1, r));
-    document.querySelector('.before').style.clipPath = `inset(0 ${(1 - r) * 100}% 0 0)`;
-    $('bar').style.left = r * 100 + '%';
-  }
-  const cmp = $('cmp');
-  const move = e => { const rc = cmp.getBoundingClientRect(); setSlider((e.clientX - rc.left) / rc.width); };
-  cmp.addEventListener('pointerdown', e => { cmp.setPointerCapture(e.pointerId); move(e); cmp.onpointermove = move; });
-  cmp.addEventListener('pointerup', () => cmp.onpointermove = null);
+  // ---- 比較ビュー（スライダー + ピンチズーム + ドラッグ移動） ----
+  const cmp = $('cmp'), stage = $('stage'), MAXZ = 16;
+  let vs = 1, tx = 0, ty = 0, ratio = 0.5;
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 
-  $('dl').onclick = () => {
-    outCanvas.toBlob(b => {
-      const a = document.createElement('a');
-      a.href = URL.createObjectURL(b); a.download = `${srcName}_x${$('scale').value}.png`; a.click();
-    }, 'image/png');
+  function applyView() {
+    const W = cmp.clientWidth, H = cmp.clientHeight;
+    vs = clamp(vs, 1, MAXZ);
+    tx = clamp(tx, W - W * vs, 0); ty = clamp(ty, H - H * vs, 0);
+    stage.style.transform = `translate(${tx}px, ${ty}px) scale(${vs})`;
+    const local = clamp((ratio * W - tx) / (vs * W), 0, 1);
+    document.querySelector('.before').style.clipPath = `inset(0 ${(1 - local) * 100}% 0 0)`;
+    $('bar').style.left = ratio * 100 + '%';
+  }
+  function setSlider(r) { ratio = clamp(r, 0, 1); applyView(); }
+  function zoomAt(f, px, py) {
+    const ns = clamp(vs * f, 1, MAXZ);
+    tx = px - (px - tx) / vs * ns; ty = py - (py - ty) / vs * ns; vs = ns; applyView();
+  }
+  function resetView() {
+    vs = 1; tx = ty = 0; ratio = 0.5;
+    cmp.style.maxWidth = Math.floor(innerHeight * 0.7 * outCanvas.width / outCanvas.height) + 'px';
+    applyView();
+  }
+
+  const pts = new Map(); let mode = null, pinch = null;
+  const rel = e => { const rc = cmp.getBoundingClientRect(); return { x: e.clientX - rc.left, y: e.clientY - rc.top, w: rc.width }; };
+  function startPinch() {
+    const [a, b] = [...pts.values()];
+    pinch = { d: Math.hypot(a.x - b.x, a.y - b.y) || 1, mx: (a.x + b.x) / 2, my: (a.y + b.y) / 2, s: vs, tx, ty };
+  }
+  cmp.addEventListener('pointerdown', e => {
+    cmp.setPointerCapture(e.pointerId);
+    const p = rel(e); pts.set(e.pointerId, p);
+    if (pts.size >= 2) { mode = 'pinch'; startPinch(); }
+    else if (e.target.closest('#knob') || vs === 1) { mode = 'slider'; setSlider(p.x / p.w); }
+    else mode = 'pan';
+  });
+  cmp.addEventListener('pointermove', e => {
+    if (!pts.has(e.pointerId)) return;
+    const prev = pts.get(e.pointerId), p = rel(e); pts.set(e.pointerId, p);
+    if (mode === 'slider') setSlider(p.x / p.w);
+    else if (mode === 'pan') { tx += p.x - prev.x; ty += p.y - prev.y; applyView(); }
+    else if (mode === 'pinch' && pts.size >= 2) {
+      const [a, b] = [...pts.values()];
+      const d = Math.hypot(a.x - b.x, a.y - b.y), mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+      const ns = clamp(pinch.s * d / pinch.d, 1, MAXZ);
+      tx = mx - (pinch.mx - pinch.tx) / pinch.s * ns; ty = my - (pinch.my - pinch.ty) / pinch.s * ns;
+      vs = ns; applyView();
+    }
+  });
+  const endPtr = e => {
+    pts.delete(e.pointerId);
+    if (pts.size === 0) mode = null;
+    else if (pts.size === 1) mode = 'pan';
+  };
+  cmp.addEventListener('pointerup', endPtr);
+  cmp.addEventListener('pointercancel', endPtr);
+  cmp.addEventListener('wheel', e => {
+    e.preventDefault(); const p = rel(e);
+    zoomAt(Math.exp(-e.deltaY * 0.002), p.x, p.y);
+  }, { passive: false });
+  cmp.addEventListener('dblclick', e => {
+    const p = rel(e); if (vs > 1) { vs = 1; tx = ty = 0; applyView(); } else zoomAt(3, p.x, p.y);
+  });
+  const center = () => [cmp.clientWidth / 2, cmp.clientHeight / 2];
+  $('zin').onclick = () => zoomAt(1.5, ...center());
+  $('zout').onclick = () => zoomAt(1 / 1.5, ...center());
+  $('zreset').onclick = () => { vs = 1; tx = ty = 0; applyView(); };
+  window.addEventListener('resize', () => outCanvas && applyView());
+
+  // ---- 保存 ----
+  let outBlob = null;
+  const outName = () => `${srcName}_x${$('scale').value}.png`;
+  function makeBlob() {
+    outBlob = null; $('save').disabled = true;
+    outCanvas.toBlob(b => { outBlob = b; $('save').disabled = false; }, 'image/png');
+  }
+  function download() {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(outBlob); a.download = outName(); a.click();
+  }
+  $('dl').onclick = () => outBlob && download();
+  $('save').onclick = async () => {
+    if (!outBlob) return;
+    const file = new File([outBlob], outName(), { type: 'image/png' });
+    if (navigator.canShare && navigator.canShare({ files: [file] })) {
+      try { await navigator.share({ files: [file] }); }
+      catch (e) { if (e.name !== 'AbortError') download(); }
+    } else download();
   };
 })();
 </script>
