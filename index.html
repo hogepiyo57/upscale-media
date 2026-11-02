@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Upscale Media - 画像を高解像度・高画質に</title>
+<meta name="description" content="画像をドラッグ&ドロップするだけで、ブラウザ内で解像度アップ。画像は外部に送信されません。">
+<style>
+  :root {
+    --bg: #0f1115; --panel: #181b22; --line: #2a2f3a; --text: #e8eaf0;
+    --muted: #8b93a5; --accent: #6c8cff; --accent2: #b06cff;
+  }
+  @media (prefers-color-scheme: light) {
+    :root { --bg: #f5f6fa; --panel: #fff; --line: #dde1ea; --text: #1b1e26; --muted: #666e80; }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: system-ui, "Hiragino Sans", "Yu Gothic UI", sans-serif;
+    background: var(--bg); color: var(--text); line-height: 1.6;
+  }
+  .wrap { max-width: 960px; margin: 0 auto; padding: 32px 16px 64px; }
+  h1 {
+    font-size: clamp(26px, 5vw, 40px); margin: 0 0 4px;
+    background: linear-gradient(90deg, var(--accent), var(--accent2));
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  .sub { color: var(--muted); margin: 0 0 24px; }
+  #drop {
+    border: 2px dashed var(--line); border-radius: 16px; background: var(--panel);
+    padding: 48px 16px; text-align: center; cursor: pointer; transition: .15s;
+  }
+  #drop.over { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, var(--panel)); }
+  #drop strong { font-size: 18px; }
+  #drop small { color: var(--muted); display: block; margin-top: 6px; }
+  .opts {
+    display: flex; flex-wrap: wrap; gap: 16px; margin: 20px 0; align-items: center;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px;
+  }
+  .opts label { display: flex; gap: 8px; align-items: center; font-size: 14px; }
+  select, button {
+    font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line);
+    border-radius: 8px; padding: 6px 10px;
+  }
+  button.primary {
+    background: linear-gradient(90deg, var(--accent), var(--accent2)); border: 0; color: #fff;
+    padding: 10px 20px; font-weight: 600; cursor: pointer;
+  }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  #status { color: var(--muted); font-size: 14px; min-height: 22px; }
+  progress { width: 100%; height: 6px; margin-top: 6px; display: none; }
+  .result { display: none; margin-top: 24px; }
+  .cmp {
+    position: relative; overflow: hidden; border-radius: 12px; border: 1px solid var(--line);
+    background: repeating-conic-gradient(#8883 0 25%, transparent 0 50%) 0 0/16px 16px;
+    user-select: none; touch-action: none;
+  }
+  .cmp canvas { display: block; width: 100%; height: auto; }
+  .cmp .before { position: absolute; inset: 0; clip-path: inset(0 50% 0 0); }
+  .cmp .before canvas { width: 100%; height: 100%; }
+  .bar {
+    position: absolute; top: 0; bottom: 0; left: 50%; width: 2px; background: #fff;
+    box-shadow: 0 0 6px #0008; pointer-events: none;
+  }
+  .tag {
+    position: absolute; top: 10px; padding: 2px 10px; border-radius: 99px; font-size: 12px;
+    background: #000a; color: #fff;
+  }
+  .tag.l { left: 10px; } .tag.r { right: 10px; }
+  .meta { color: var(--muted); font-size: 14px; margin: 10px 0; }
+  .note { color: var(--muted); font-size: 13px; margin-top: 32px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Upscale Media</h1>
+  <p class="sub">画像をドロップするだけで、解像度を上げてきれいに。処理はすべてあなたのブラウザ内で行われ、画像は外部に送信されません。</p>
+
+  <div id="drop" tabindex="0">
+    <strong>ここに画像をドラッグ&ドロップ</strong>
+    <small>またはクリックしてファイルを選択（PNG / JPEG / WebP）</small>
+    <input id="file" type="file" accept="image/*" hidden>
+  </div>
+
+  <div class="opts">
+    <label>拡大率
+      <select id="scale">
+        <option value="2" selected>2倍</option>
+        <option value="3">3倍</option>
+        <option value="4">4倍</option>
+      </select>
+    </label>
+    <label>方式
+      <select id="mode">
+        <option value="ai" selected>AI（ESRGAN）— 高品質・やや重い</option>
+        <option value="fast">高速（補間＋シャープ化）</option>
+      </select>
+    </label>
+    <label>シャープ化
+      <select id="sharp">
+        <option value="0">なし</option>
+        <option value="0.4" selected>弱</option>
+        <option value="0.8">強</option>
+      </select>
+    </label>
+    <button id="run" class="primary" disabled>高画質化する</button>
+  </div>
+  <div id="status"></div>
+  <progress id="prog" max="1" value="0"></progress>
+
+  <div class="result" id="result">
+    <div class="meta" id="meta"></div>
+    <div class="cmp" id="cmp">
+      <canvas id="after"></canvas>
+      <div class="before"><canvas id="before"></canvas></div>
+      <div class="bar" id="bar"></div>
+      <span class="tag l">Before</span><span class="tag r">After</span>
+    </div>
+    <p style="margin-top:14px"><button id="dl" class="primary">PNGで保存</button></p>
+  </div>
+
+  <p class="note">AI方式は初回のみモデル（数MB）をダウンロードします。大きな画像は自動的に分割して処理します。AIが使えない環境では高速方式に自動で切り替わります。</p>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js" defer></script>
+<script src="https://cdn.jsdelivr.net/npm/@upscalerjs/default-model@1.0.0/dist/umd/index.min.js" defer></script>
+<script src="https://cdn.jsdelivr.net/npm/upscaler@1.0.0/dist/browser/umd/upscaler.min.js" defer></script>
+<script src="https://cdn.jsdelivr.net/npm/@upscalerjs/esrgan-slim@1.0.0/dist/umd/models/esrgan-slim/src/x2/index.min.js" defer></script>
+<script src="https://cdn.jsdelivr.net/npm/@upscalerjs/esrgan-slim@1.0.0/dist/umd/models/esrgan-slim/src/x3/index.min.js" defer></script>
+<script src="https://cdn.jsdelivr.net/npm/@upscalerjs/esrgan-slim@1.0.0/dist/umd/models/esrgan-slim/src/x4/index.min.js" defer></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const drop = $('drop'), fileIn = $('file'), run = $('run'), status = $('status'), prog = $('prog');
+  const MAX_OUT = 8192 * 8192 / 2; // 出力ピクセル数の上限
+  let srcImg = null, srcName = 'image', outCanvas = null;
+  const upscalers = {};
+
+  const setStatus = t => status.textContent = t;
+
+  function load(file) {
+    if (!file || !file.type.startsWith('image/')) return setStatus('画像ファイルを選んでください。');
+    const img = new Image();
+    img.onload = () => {
+      srcImg = img; srcName = file.name.replace(/\.[^.]+$/, '');
+      run.disabled = false; $('result').style.display = 'none';
+      setStatus(`読み込み完了: ${img.naturalWidth}×${img.naturalHeight}px。「高画質化する」を押してください。`);
+    };
+    img.onerror = () => setStatus('画像を読み込めませんでした。');
+    img.src = URL.createObjectURL(file);
+  }
+
+  drop.onclick = () => fileIn.click();
+  drop.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') fileIn.click(); };
+  fileIn.onchange = () => load(fileIn.files[0]);
+  ['dragenter', 'dragover'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('over'); }));
+  ['dragleave', 'drop'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('over'); }));
+  drop.addEventListener('drop', e => load(e.dataTransfer.files[0]));
+  window.addEventListener('dragover', e => e.preventDefault());
+  window.addEventListener('drop', e => e.preventDefault());
+
+  // 補間（段階的に2倍ずつ拡大して品質を保つ）
+  function resizeSmooth(src, w, h) {
+    let cur = src, cw = src.width || src.naturalWidth, ch = src.height || src.naturalHeight;
+    while (cw < w || ch < h) {
+      const nw = Math.min(w, cw * 2), nh = Math.min(h, ch * 2);
+      const c = document.createElement('canvas'); c.width = nw; c.height = nh;
+      const g = c.getContext('2d'); g.imageSmoothingEnabled = true; g.imageSmoothingQuality = 'high';
+      g.drawImage(cur, 0, 0, nw, nh);
+      cur = c; cw = nw; ch = nh;
+    }
+    return cur;
+  }
+
+  // アンシャープマスク
+  function sharpen(canvas, amount) {
+    if (!amount) return canvas;
+    const w = canvas.width, h = canvas.height, g = canvas.getContext('2d');
+    const img = g.getImageData(0, 0, w, h), d = img.data, o = new Uint8ClampedArray(d);
+    for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) {
+      const i = (y * w + x) * 4;
+      for (let c = 0; c < 3; c++) {
+        const lap = 4 * o[i + c] - o[i - 4 + c] - o[i + 4 + c] - o[i - w * 4 + c] - o[i + w * 4 + c];
+        d[i + c] = o[i + c] + amount * lap;
+      }
+    }
+    g.putImageData(img, 0, 0);
+    return canvas;
+  }
+
+  function getUpscaler(scale) {
+    if (upscalers[scale]) return upscalers[scale];
+    const defs = { 2: window.ESRGANSlim2x, 3: window.ESRGANSlim3x, 4: window.ESRGANSlim4x };
+    const m = defs[scale];
+    if (!m || !window.Upscaler || !window.tf) throw new Error('AIライブラリを読み込めませんでした');
+    const path = `https://cdn.jsdelivr.net/npm/@upscalerjs/esrgan-slim@1.0.0/models/x${scale}/model.json`;
+    const model = { ...m, path, _internals: { ...(m._internals || {}), path } };
+    return upscalers[scale] = new Upscaler({ model });
+  }
+
+  async function aiUpscale(img, scale) {
+    const up = getUpscaler(scale);
+    const dataUrl = await up.upscale(img, {
+      patchSize: 64, padding: 4,
+      progress: p => { prog.value = p; },
+    });
+    const out = new Image();
+    await new Promise((res, rej) => { out.onload = res; out.onerror = rej; out.src = dataUrl; });
+    const c = document.createElement('canvas'); c.width = out.naturalWidth; c.height = out.naturalHeight;
+    c.getContext('2d').drawImage(out, 0, 0);
+    return c;
+  }
+
+  run.onclick = async () => {
+    if (!srcImg) return;
+    run.disabled = true; prog.style.display = 'block'; prog.value = 0;
+    const scale = +$('scale').value, sharp = +$('sharp').value;
+    const w0 = srcImg.naturalWidth, h0 = srcImg.naturalHeight;
+    if (w0 * h0 * scale * scale > MAX_OUT) {
+      setStatus('出力が大きすぎます。拡大率を下げるか、小さい画像を使ってください。');
+      run.disabled = false; prog.style.display = 'none'; return;
+    }
+    const t0 = performance.now();
+    let result, used = $('mode').value;
+    try {
+      if (used === 'ai') {
+        setStatus('AIモデルを読み込んで処理中…（初回は少し時間がかかります）');
+        result = await aiUpscale(srcImg, scale);
+      }
+    } catch (e) {
+      console.warn(e); used = 'fast';
+      setStatus('AI処理に失敗したため、高速方式に切り替えます…');
+    }
+    if (!result) {
+      used = 'fast';
+      result = resizeSmooth(srcImg, w0 * scale, h0 * scale);
+      const c = document.createElement('canvas'); c.width = result.width; c.height = result.height;
+      c.getContext('2d').drawImage(result, 0, 0); result = c;
+    }
+    await new Promise(r => setTimeout(r, 0));
+    outCanvas = sharpen(result, used === 'ai' ? sharp * 0.5 : sharp);
+    show(w0, h0, ((performance.now() - t0) / 1000).toFixed(1), used);
+    run.disabled = false; prog.style.display = 'none';
+  };
+
+  function show(w0, h0, sec, used) {
+    const a = $('after'), b = $('before');
+    a.width = outCanvas.width; a.height = outCanvas.height;
+    a.getContext('2d').drawImage(outCanvas, 0, 0);
+    b.width = outCanvas.width; b.height = outCanvas.height;
+    const g = b.getContext('2d'); g.imageSmoothingEnabled = false;
+    g.drawImage(srcImg, 0, 0, outCanvas.width, outCanvas.height);
+    $('result').style.display = 'block';
+    $('meta').textContent = `${w0}×${h0} → ${outCanvas.width}×${outCanvas.height}px（${used === 'ai' ? 'AI' : '高速'}方式・${sec}秒）。バーをドラッグで比較できます。`;
+    setStatus('完了しました。');
+    setSlider(0.5);
+  }
+
+  function setSlider(r) {
+    r = Math.max(0, Math.min(1, r));
+    document.querySelector('.before').style.clipPath = `inset(0 ${(1 - r) * 100}% 0 0)`;
+    $('bar').style.left = r * 100 + '%';
+  }
+  const cmp = $('cmp');
+  const move = e => { const rc = cmp.getBoundingClientRect(); setSlider((e.clientX - rc.left) / rc.width); };
+  cmp.addEventListener('pointerdown', e => { cmp.setPointerCapture(e.pointerId); move(e); cmp.onpointermove = move; });
+  cmp.addEventListener('pointerup', () => cmp.onpointermove = null);
+
+  $('dl').onclick = () => {
+    outCanvas.toBlob(b => {
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(b); a.download = `${srcName}_x${$('scale').value}.png`; a.click();
+    }, 'image/png');
+  };
+})();
+</script>
+</body>
+</html>
