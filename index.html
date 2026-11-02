@@ -85,8 +85,9 @@
   .cmp .before canvas { width: 100%; height: 100%; }
   .bar {
     position: absolute; top: 0; bottom: 0; left: 50%; width: 2px; margin-left: -1px; background: #fff;
-    box-shadow: 0 0 6px #0008; pointer-events: none;
+    box-shadow: 0 0 6px #0008; touch-action: none; cursor: ew-resize;
   }
+  .bar::before { content: ''; position: absolute; top: 0; bottom: 0; left: -18px; right: -18px; }
   .knob {
     position: absolute; top: 50%; left: 50%; width: 44px; height: 44px; margin: -22px 0 0 -22px;
     border-radius: 50%; background: #fff; color: #333; display: grid; place-items: center;
@@ -108,7 +109,7 @@
 </head>
 <body>
 <div class="wrap">
-  <h1>Upscale Media <span class="ver">v3</span></h1>
+  <h1>Upscale Media <span class="ver">v4</span></h1>
   <p class="sub">画像をドロップするだけで、解像度を上げてきれいに。処理はすべてあなたのブラウザ内で行われ、画像は外部に送信されません。</p>
 
   <label id="drop" for="file">
@@ -341,7 +342,7 @@
     cmp.setPointerCapture(e.pointerId);
     const p = rel(e); pts.set(e.pointerId, p);
     if (pts.size >= 2) { mode = 'pinch'; startPinch(); }
-    else if (e.target.closest('#knob') || vs === 1) { mode = 'slider'; setSlider(p.x / p.w); }
+    else if (e.target.closest('#bar') || vs === 1) { mode = 'slider'; setSlider(p.x / p.w); }
     else mode = 'pan';
   });
   cmp.addEventListener('pointermove', e => {
