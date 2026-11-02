@@ -109,7 +109,7 @@
 </head>
 <body>
 <div class="wrap">
-  <h1>Upscale Media <span class="ver">v4</span></h1>
+  <h1>Upscale Media <span class="ver">v5</span></h1>
   <p class="sub">画像をドロップするだけで、解像度を上げてきれいに。処理はすべてあなたのブラウザ内で行われ、画像は外部に送信されません。</p>
 
   <label id="drop" for="file">
@@ -131,17 +131,12 @@
         <option value="4">4倍</option>
       </select>
     </label>
-    <label>方式
-      <select id="mode">
-        <option value="ai" selected>AI（ESRGAN）— 高品質・やや重い</option>
-        <option value="fast">高速（補間＋シャープ化）</option>
-      </select>
-    </label>
-    <label>シャープ化
+    <label>鮮明さ
       <select id="sharp">
         <option value="0">なし</option>
-        <option value="0.4" selected>弱</option>
-        <option value="0.8">強</option>
+        <option value="0.8">弱</option>
+        <option value="1.6" selected>標準</option>
+        <option value="2.6">強</option>
       </select>
     </label>
     <button id="run" class="primary" disabled>高画質化する</button>
@@ -168,23 +163,16 @@
     <p class="hint2">iPhone / iPad は「写真に保存」→ 共有メニューの「画像を保存」で写真アプリに入ります。</p>
   </div>
 
-  <p class="note">AI方式は初回のみモデル（数MB）をダウンロードします。大きな画像は自動的に分割して処理します。AIが使えない環境では高速方式に自動で切り替わります。</p>
+  <p class="note">高品質な補間（Lanczos）で拡大し、輪郭だけを選んで鮮明化します。処理はすべて端末内で行われます。</p>
 </div>
 
-<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js" defer></script>
-<script src="https://cdn.jsdelivr.net/npm/@upscalerjs/default-model@1.0.0/dist/umd/index.min.js" defer></script>
-<script src="https://cdn.jsdelivr.net/npm/upscaler@1.0.0/dist/browser/umd/upscaler.min.js" defer></script>
-<script src="https://cdn.jsdelivr.net/npm/@upscalerjs/esrgan-slim@1.0.0/dist/umd/models/esrgan-slim/src/x2/index.min.js" defer></script>
-<script src="https://cdn.jsdelivr.net/npm/@upscalerjs/esrgan-slim@1.0.0/dist/umd/models/esrgan-slim/src/x3/index.min.js" defer></script>
-<script src="https://cdn.jsdelivr.net/npm/@upscalerjs/esrgan-slim@1.0.0/dist/umd/models/esrgan-slim/src/x4/index.min.js" defer></script>
 <script>
 (() => {
   const $ = id => document.getElementById(id);
   const drop = $('drop'), fileIn = $('file'), run = $('run'), status = $('status'), prog = $('prog');
   const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
-  const MAX_OUT = isIOS ? 4096 * 4096 : 8192 * 8192 / 2; // 出力ピクセル数の上限（iOSはキャンバス上限が小さい）
+  const MAX_OUT = isIOS ? 3072 * 3072 : 8192 * 8192 / 2; // 出力ピクセル数の上限（iOSはキャンバス上限が小さい）
   let srcImg = null, srcName = 'image', outCanvas = null;
-  const upscalers = {};
 
   const setStatus = t => status.textContent = t;
 
@@ -209,91 +197,131 @@
   window.addEventListener('dragover', e => e.preventDefault());
   window.addEventListener('drop', e => e.preventDefault());
 
-  // 補間（段階的に2倍ずつ拡大して品質を保つ）
-  function resizeSmooth(src, w, h) {
-    let cur = src, cw = src.width || src.naturalWidth, ch = src.height || src.naturalHeight;
-    while (cw < w || ch < h) {
-      const nw = Math.min(w, cw * 2), nh = Math.min(h, ch * 2);
-      const c = document.createElement('canvas'); c.width = nw; c.height = nh;
-      const g = c.getContext('2d'); g.imageSmoothingEnabled = true; g.imageSmoothingQuality = 'high';
-      g.drawImage(cur, 0, 0, nw, nh);
-      cur = c; cw = nw; ch = nh;
+  const tick = () => new Promise(r => setTimeout(r, 0));
+
+  // Lanczos3 の重みを出力画素ごとに前計算（6タップ）
+  const lanczos = x => {
+    if (x === 0) return 1;
+    if (x <= -3 || x >= 3) return 0;
+    const px = Math.PI * x;
+    return 3 * Math.sin(px) * Math.sin(px / 3) / (px * px);
+  };
+  function weights(inLen, outLen) {
+    const idx = new Int32Array(outLen * 6), w = new Float32Array(outLen * 6), sc = outLen / inLen;
+    for (let o = 0; o < outLen; o++) {
+      const center = (o + 0.5) / sc - 0.5, start = Math.floor(center) - 2;
+      let sum = 0;
+      for (let k = 0; k < 6; k++) {
+        const wt = lanczos(center - (start + k));
+        idx[o * 6 + k] = Math.min(inLen - 1, Math.max(0, start + k));
+        w[o * 6 + k] = wt; sum += wt;
+      }
+      for (let k = 0; k < 6; k++) w[o * 6 + k] /= sum;
     }
-    return cur;
+    return { idx, w };
   }
 
-  // アンシャープマスク
-  function sharpen(canvas, amount) {
-    if (!amount) return canvas;
-    const w = canvas.width, h = canvas.height, g = canvas.getContext('2d');
-    const img = g.getImageData(0, 0, w, h), d = img.data, o = new Uint8ClampedArray(d);
-    for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) {
-      const i = (y * w + x) * 4;
-      for (let c = 0; c < 3; c++) {
-        const lap = 4 * o[i + c] - o[i - 4 + c] - o[i + 4 + c] - o[i - w * 4 + c] - o[i + w * 4 + c];
-        d[i + c] = o[i + c] + amount * lap;
+  // Lanczos3 リサンプリング（横→縦の2パス）。ぼやけにくい高品質な拡大。
+  async function lanczosResize(src, W, H, onProg) {
+    const sw = src.naturalWidth, sh = src.naturalHeight;
+    const c0 = document.createElement('canvas'); c0.width = sw; c0.height = sh;
+    const g0 = c0.getContext('2d', { willReadFrequently: true }); g0.drawImage(src, 0, 0);
+    const sd = g0.getImageData(0, 0, sw, sh).data;
+    const wx = weights(sw, W), tmp = new Uint8ClampedArray(W * sh * 4);
+    for (let y = 0; y < sh; y++) {
+      for (let x = 0; x < W; x++) {
+        let r = 0, g = 0, b = 0, a = 0;
+        for (let k = 0; k < 6; k++) {
+          const i = (y * sw + wx.idx[x * 6 + k]) * 4, wt = wx.w[x * 6 + k];
+          r += sd[i] * wt; g += sd[i + 1] * wt; b += sd[i + 2] * wt; a += sd[i + 3] * wt;
+        }
+        const o = (y * W + x) * 4;
+        tmp[o] = r; tmp[o + 1] = g; tmp[o + 2] = b; tmp[o + 3] = a;
+      }
+      if (y % 64 === 63) { onProg(0.4 * y / sh); await tick(); }
+    }
+    const wy = weights(sh, H), out = new Uint8ClampedArray(W * H * 4), row = W * 4;
+    for (let y = 0; y < H; y++) {
+      const r0 = wy.idx[y * 6] * row, r1 = wy.idx[y * 6 + 1] * row, r2 = wy.idx[y * 6 + 2] * row,
+            r3 = wy.idx[y * 6 + 3] * row, r4 = wy.idx[y * 6 + 4] * row, r5 = wy.idx[y * 6 + 5] * row;
+      const w0 = wy.w[y * 6], w1 = wy.w[y * 6 + 1], w2 = wy.w[y * 6 + 2],
+            w3 = wy.w[y * 6 + 3], w4 = wy.w[y * 6 + 4], w5 = wy.w[y * 6 + 5];
+      const base = y * row;
+      for (let j = 0; j < row; j++) {
+        out[base + j] = tmp[r0 + j] * w0 + tmp[r1 + j] * w1 + tmp[r2 + j] * w2 +
+                        tmp[r3 + j] * w3 + tmp[r4 + j] * w4 + tmp[r5 + j] * w5;
+      }
+      if (y % 64 === 63) { onProg(0.4 + 0.3 * y / H); await tick(); }
+    }
+    return out;
+  }
+
+  // ぼかし（ボックスブラー）
+  function boxH(src, dst, w, h, r) {
+    const d = 2 * r + 1;
+    for (let y = 0; y < h; y++) {
+      const row = y * w; let sum = 0;
+      for (let i = -r; i <= r; i++) sum += src[row + Math.min(w - 1, Math.max(0, i))];
+      for (let x = 0; x < w; x++) {
+        dst[row + x] = sum / d;
+        sum += src[row + Math.min(w - 1, x + r + 1)] - src[row + Math.max(0, x - r)];
       }
     }
-    g.putImageData(img, 0, 0);
-    return canvas;
+  }
+  function boxV(src, dst, w, h, r) {
+    const d = 2 * r + 1;
+    for (let x = 0; x < w; x++) {
+      let sum = 0;
+      for (let i = -r; i <= r; i++) sum += src[Math.min(h - 1, Math.max(0, i)) * w + x];
+      for (let y = 0; y < h; y++) {
+        dst[y * w + x] = sum / d;
+        sum += src[Math.min(h - 1, y + r + 1) * w + x] - src[Math.max(0, y - r) * w + x];
+      }
+    }
   }
 
-  function getUpscaler(scale) {
-    if (upscalers[scale]) return upscalers[scale];
-    const defs = { 2: window.ESRGANSlim2x, 3: window.ESRGANSlim3x, 4: window.ESRGANSlim4x };
-    const m = defs[scale];
-    if (!m || !window.Upscaler || !window.tf) throw new Error('AIライブラリを読み込めませんでした');
-    const path = `https://cdn.jsdelivr.net/npm/@upscalerjs/esrgan-slim@1.0.0/models/x${scale}/model.json`;
-    const model = { ...m, path, _internals: { ...(m._internals || {}), path } };
-    return upscalers[scale] = new Upscaler({ model });
-  }
-
-  async function aiUpscale(img, scale) {
-    const up = getUpscaler(scale);
-    const dataUrl = await up.upscale(img, {
-      patchSize: 64, padding: 4,
-      progress: p => { prog.value = p; },
-    });
-    const out = new Image();
-    await new Promise((res, rej) => { out.onload = res; out.onerror = rej; out.src = dataUrl; });
-    const c = document.createElement('canvas'); c.width = out.naturalWidth; c.height = out.naturalHeight;
-    c.getContext('2d').drawImage(out, 0, 0);
-    return c;
+  // 輝度だけにかけるアンシャープマスク（色にじみを出さず輪郭を立てる）
+  async function sharpen(d, w, h, amount, scale, onProg) {
+    if (!amount) return;
+    const n = w * h, A = new Float32Array(n), B = new Float32Array(n), r = Math.max(1, Math.round(scale * 0.75));
+    for (let p = 0, i = 0; p < n; p++, i += 4) A[p] = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+    boxH(A, B, w, h, r); onProg(0.2); await tick();
+    boxV(B, A, w, h, r); onProg(0.4); await tick();
+    boxH(A, B, w, h, r); onProg(0.6); await tick();
+    boxV(B, A, w, h, r); onProg(0.8); await tick();
+    for (let p = 0, i = 0; p < n; p++, i += 4) {
+      const y = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2], diff = y - A[p], ad = Math.abs(diff);
+      const gate = ad < 3 ? ad / 3 : 1; // 平坦部のノイズは強調しない
+      const dl = Math.max(-60, Math.min(60, amount * diff * gate));
+      d[i] += dl; d[i + 1] += dl; d[i + 2] += dl;
+    }
   }
 
   run.onclick = async () => {
     if (!srcImg) return;
     run.disabled = true; prog.style.display = 'block'; prog.value = 0;
     const scale = +$('scale').value, sharp = +$('sharp').value;
-    const w0 = srcImg.naturalWidth, h0 = srcImg.naturalHeight;
-    if (w0 * h0 * scale * scale > MAX_OUT) {
+    const w0 = srcImg.naturalWidth, h0 = srcImg.naturalHeight, W = w0 * scale, H = h0 * scale;
+    if (W * H > MAX_OUT) {
       setStatus('出力が大きすぎます。拡大率を下げるか、小さい画像を使ってください。');
       run.disabled = false; prog.style.display = 'none'; return;
     }
     const t0 = performance.now();
-    let result, used = $('mode').value;
+    setStatus('高画質化しています…');
     try {
-      if (used === 'ai') {
-        setStatus('AIモデルを読み込んで処理中…（初回は少し時間がかかります）');
-        result = await aiUpscale(srcImg, scale);
-      }
+      const data = await lanczosResize(srcImg, W, H, p => { prog.value = p; });
+      await sharpen(data, W, H, sharp, scale, p => { prog.value = 0.7 + 0.3 * p; });
+      outCanvas = document.createElement('canvas'); outCanvas.width = W; outCanvas.height = H;
+      outCanvas.getContext('2d').putImageData(new ImageData(data, W, H), 0, 0);
+      show(w0, h0, ((performance.now() - t0) / 1000).toFixed(1));
     } catch (e) {
-      console.warn(e); used = 'fast';
-      setStatus('AI処理に失敗したため、高速方式に切り替えます…');
+      console.error(e);
+      setStatus('処理に失敗しました（メモリ不足の可能性があります）。拡大率を下げてお試しください。');
     }
-    if (!result) {
-      used = 'fast';
-      result = resizeSmooth(srcImg, w0 * scale, h0 * scale);
-      const c = document.createElement('canvas'); c.width = result.width; c.height = result.height;
-      c.getContext('2d').drawImage(result, 0, 0); result = c;
-    }
-    await new Promise(r => setTimeout(r, 0));
-    outCanvas = sharpen(result, used === 'ai' ? sharp * 0.5 : sharp);
-    show(w0, h0, ((performance.now() - t0) / 1000).toFixed(1), used);
     run.disabled = false; prog.style.display = 'none';
   };
 
-  function show(w0, h0, sec, used) {
+  function show(w0, h0, sec) {
     const a = $('after'), b = $('before');
     a.width = outCanvas.width; a.height = outCanvas.height;
     a.getContext('2d').drawImage(outCanvas, 0, 0);
@@ -301,7 +329,7 @@
     const g = b.getContext('2d'); g.imageSmoothingEnabled = false;
     g.drawImage(srcImg, 0, 0, outCanvas.width, outCanvas.height);
     $('result').style.display = 'block';
-    $('meta').textContent = `${w0}×${h0} → ${outCanvas.width}×${outCanvas.height}px（${used === 'ai' ? 'AI' : '高速'}方式・${sec}秒）。`;
+    $('meta').textContent = `${w0}×${h0} → ${outCanvas.width}×${outCanvas.height}px（Lanczos拡大＋鮮明化・${sec}秒）。`;
     setStatus('完了しました。');
     resetView(); makeBlob();
     $('result').scrollIntoView({ behavior: 'smooth', block: 'start' });
